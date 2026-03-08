@@ -87,13 +87,16 @@ impl Tunnel for NgrokTunnel {
             let error_detail = if let Some(stderr) = stderr {
                 let mut err_reader = tokio::io::BufReader::new(stderr).lines();
                 let mut lines = Vec::new();
-                while let Ok(Ok(Some(line))) = tokio::time::timeout(
-                    tokio::time::Duration::from_secs(1),
-                    err_reader.next_line(),
-                )
-                .await
-                {
-                    lines.push(line);
+                while lines.len() < 10 {
+                    match tokio::time::timeout(
+                        tokio::time::Duration::from_secs(1),
+                        err_reader.next_line(),
+                    )
+                    .await
+                    {
+                        Ok(Ok(Some(line))) => lines.push(line),
+                        _ => break,
+                    }
                 }
                 lines.join("\n")
             } else {
