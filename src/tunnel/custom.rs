@@ -279,7 +279,10 @@ mod tests {
         tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
 
         // Child should still be alive (not blocked/zombie).
-        assert!(tunnel.health_check().await, "yes process should still be alive");
+        assert!(
+            tunnel.health_check().await,
+            "yes process should still be alive"
+        );
 
         tunnel.stop().await.unwrap();
     }
