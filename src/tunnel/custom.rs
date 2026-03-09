@@ -265,4 +265,22 @@ mod tests {
     fn extract_url_none_when_absent() {
         assert_eq!(extract_url("no url here"), None);
     }
+
+    #[tokio::test]
+    async fn stdout_drain_prevents_zombie() {
+        // `yes` floods stdout indefinitely; without the drain task the pipe
+        // buffer fills (64 KB) and the child blocks on write(), becoming a
+        // zombie. With draining the child stays alive and stop() can kill it.
+        let tunnel = CustomTunnel::new("yes".into(), None, None);
+        let url = tunnel.start("127.0.0.1", 19999).await.unwrap();
+        assert_eq!(url, "http://127.0.0.1:19999");
+
+        // Give the drain task time to consume some output.
+        tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
+
+        // Child should still be alive (not blocked/zombie).
+        assert!(tunnel.health_check().await, "yes process should still be alive");
+
+        tunnel.stop().await.unwrap();
+    }
 }
