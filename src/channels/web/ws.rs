@@ -513,6 +513,7 @@ mod tests {
             cost_guard: None,
             routine_engine: Arc::new(tokio::sync::RwLock::new(None)),
             startup_time: std::time::Instant::now(),
+            webhook_proxy_addr: None,
         }
     }
 }

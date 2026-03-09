@@ -101,6 +101,7 @@ impl GatewayChannel {
             cost_guard: None,
             routine_engine: Arc::new(tokio::sync::RwLock::new(None)),
             startup_time: std::time::Instant::now(),
+            webhook_proxy_addr: None,
         });
 
         Self {
@@ -137,6 +138,7 @@ impl GatewayChannel {
             cost_guard: self.state.cost_guard.clone(),
             routine_engine: Arc::clone(&self.state.routine_engine),
             startup_time: self.state.startup_time,
+            webhook_proxy_addr: self.state.webhook_proxy_addr,
         };
         mutate(&mut new_state);
         self.state = Arc::new(new_state);
@@ -239,6 +241,15 @@ impl GatewayChannel {
     /// Inject the cost guard for token/cost tracking in the status popover.
     pub fn with_cost_guard(mut self, cg: Arc<crate::agent::cost_guard::CostGuard>) -> Self {
         self.rebuild_state(|s| s.cost_guard = Some(cg));
+        self
+    }
+
+    /// Set the webhook server address for reverse proxying /webhook/* requests.
+    ///
+    /// This allows the tunnel (bound to gateway port 3000) to forward webhook
+    /// requests to the webhook server (port 8080).
+    pub fn with_webhook_proxy(mut self, addr: SocketAddr) -> Self {
+        self.rebuild_state(|s| s.webhook_proxy_addr = Some(addr));
         self
     }
 

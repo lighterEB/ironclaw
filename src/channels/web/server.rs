@@ -173,6 +173,8 @@ pub struct GatewayState {
     pub routine_engine: RoutineEngineSlot,
     /// Server startup time for uptime calculation.
     pub startup_time: std::time::Instant,
+    /// Webhook server address for reverse proxy (tunnel → gateway → webhook server).
+    pub webhook_proxy_addr: Option<SocketAddr>,
 }
 
 /// Start the gateway HTTP server.
@@ -200,7 +202,12 @@ pub async fn start_server(
     // Public routes (no auth)
     let public = Router::new()
         .route("/api/health", get(health_handler))
-        .route("/oauth/callback", get(oauth_callback_handler));
+        .route("/oauth/callback", get(oauth_callback_handler))
+        // Webhook proxy (forward /webhook/* to webhook server)
+        .route(
+            "/webhook/{*path}",
+            get(webhook_proxy_handler).post(webhook_proxy_handler),
+        );
 
     // Protected routes (require auth)
     let auth_state = AuthState { token: auth_token };
@@ -2422,6 +2429,118 @@ struct GatewayStatusResponse {
     model_usage: Option<Vec<ModelUsageEntry>>,
 }
 
+// --- Webhook proxy ---
+
+/// Reverse proxy handler for /webhook/* requests.
+///
+/// Forwards requests to the webhook server (typically on port 8080) so that
+/// external webhooks via tunnel can reach the webhook endpoints.
+async fn webhook_proxy_handler(
+    State(state): State<Arc<GatewayState>>,
+    path: Path<String>,
+    req: axum::http::Request<axum::body::Body>,
+) -> impl IntoResponse {
+    use axum::body::Body;
+
+    let webhook_addr = match state.webhook_proxy_addr {
+        Some(addr) => addr,
+        None => {
+            tracing::warn!("Webhook proxy requested but no webhook server address configured");
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Webhook server not configured",
+            )
+                .into_response();
+        }
+    };
+
+    let path = path.0;
+    let method = req.method().clone();
+    let uri = format!("http://{}/webhook/{}", webhook_addr, path);
+
+    tracing::debug!(
+        method = %method,
+        uri = %uri,
+        "Proxying webhook request"
+    );
+
+    // Build the proxy request
+    let url = match reqwest::Url::parse(&uri) {
+        Ok(u) => u,
+        Err(e) => {
+            tracing::error!("Failed to parse proxy URL '{}': {}", uri, e);
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Failed to construct proxy URL",
+            )
+                .into_response();
+        }
+    };
+    let mut builder = reqwest::Request::new(method, url);
+
+    // Copy headers from original request
+    let headers = builder.headers_mut();
+    for (name, value) in req.headers() {
+        if name != hyper::header::HOST {
+            headers.insert(name, value.clone());
+        }
+    }
+
+    // Forward the request body if present
+    let body_bytes = match axum::body::to_bytes(req.into_body(), 15 * 1024 * 1024).await {
+        Ok(bytes) => bytes,
+        Err(e) => {
+            tracing::error!("Failed to read request body: {}", e);
+            return (StatusCode::BAD_REQUEST, "Failed to read request body").into_response();
+        }
+    };
+
+    *builder.body_mut() = Some(body_bytes.into());
+
+    // Send the proxied request
+    let client = reqwest::Client::new();
+    let response = match client.execute(builder).await {
+        Ok(resp) => resp,
+        Err(e) => {
+            tracing::error!("Webhook proxy request failed: {}", e);
+            return (
+                StatusCode::BAD_GATEWAY,
+                format!("Webhook proxy error: {}", e),
+            )
+                .into_response();
+        }
+    };
+
+    // Build the response
+    let status = response.status();
+    let mut resp_builder = axum::response::Response::builder().status(status);
+
+    // Copy response headers
+    for (name, value) in response.headers() {
+        if let Ok(name) = axum::http::HeaderName::try_from(name.as_str()) {
+            if let Ok(value) = axum::http::HeaderValue::try_from(value.as_bytes()) {
+                resp_builder = resp_builder.header(name, value);
+            }
+        }
+    }
+
+    // Forward response body
+    let body_bytes = match response.bytes().await {
+        Ok(bytes) => bytes,
+        Err(e) => {
+            tracing::error!("Failed to read webhook response body: {}", e);
+            return (StatusCode::BAD_GATEWAY, "Failed to read response body").into_response();
+        }
+    };
+
+    resp_builder
+        .body(Body::from(body_bytes))
+        .unwrap()
+        .into_response()
+}
+
+// --- Tests ---
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2530,6 +2649,7 @@ mod tests {
             cost_guard: None,
             routine_engine: Arc::new(tokio::sync::RwLock::new(None)),
             startup_time: std::time::Instant::now(),
+            webhook_proxy_addr: None,
         })
     }
 
@@ -2844,5 +2964,195 @@ mod tests {
                 .get("test_nonce")
                 .is_none()
         );
+    }
+
+    // --- Webhook proxy tests ---
+
+    /// Helper to create a minimal webhook server for testing.
+    async fn start_mock_webhook_server() -> (SocketAddr, tokio::task::JoinHandle<()>) {
+        use axum::routing::post;
+
+        let app = Router::new()
+            .route("/webhook/test", post(|| async { "webhook-received" }))
+            .route(
+                "/webhook/slack",
+                post(|| async { "slack-webhook-received" }),
+            );
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let handle = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        (addr, handle)
+    }
+
+    #[tokio::test]
+    async fn test_webhook_proxy_forwards_to_webhook_server() {
+        use axum::body::Body;
+        use tower::ServiceExt;
+
+        // Start a mock webhook server
+        let (webhook_addr, _handle) = start_mock_webhook_server().await;
+
+        // Create gateway state with webhook proxy configured
+        let state = Arc::new(GatewayState {
+            msg_tx: tokio::sync::RwLock::new(None),
+            sse: SseManager::new(),
+            workspace: None,
+            session_manager: None,
+            log_broadcaster: None,
+            log_level_handle: None,
+            extension_manager: None,
+            tool_registry: None,
+            store: None,
+            job_manager: None,
+            prompt_queue: None,
+            user_id: "test".to_string(),
+            shutdown_tx: tokio::sync::RwLock::new(None),
+            ws_tracker: None,
+            llm_provider: None,
+            skill_registry: None,
+            skill_catalog: None,
+            scheduler: None,
+            chat_rate_limiter: RateLimiter::new(30, 60),
+            registry_entries: vec![],
+            cost_guard: None,
+            routine_engine: Arc::new(tokio::sync::RwLock::new(None)),
+            startup_time: std::time::Instant::now(),
+            webhook_proxy_addr: Some(webhook_addr),
+        });
+
+        let app = Router::new()
+            .route("/webhook/{*path}", post(webhook_proxy_handler))
+            .with_state(state);
+
+        // Send a POST request to /webhook/test
+        let req = axum::http::Request::builder()
+            .method("POST")
+            .uri("/webhook/test")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"test": "data"}"#))
+            .expect("request");
+
+        let resp = ServiceExt::<axum::http::Request<Body>>::oneshot(app, req)
+            .await
+            .expect("response");
+
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let body = axum::body::to_bytes(resp.into_body(), 1024)
+            .await
+            .expect("body");
+        assert_eq!(&body[..], b"webhook-received");
+    }
+
+    #[tokio::test]
+    async fn test_webhook_proxy_returns_503_when_not_configured() {
+        use axum::body::Body;
+        use tower::ServiceExt;
+
+        // Create gateway state WITHOUT webhook proxy configured
+        let state = Arc::new(GatewayState {
+            msg_tx: tokio::sync::RwLock::new(None),
+            sse: SseManager::new(),
+            workspace: None,
+            session_manager: None,
+            log_broadcaster: None,
+            log_level_handle: None,
+            extension_manager: None,
+            tool_registry: None,
+            store: None,
+            job_manager: None,
+            prompt_queue: None,
+            user_id: "test".to_string(),
+            shutdown_tx: tokio::sync::RwLock::new(None),
+            ws_tracker: None,
+            llm_provider: None,
+            skill_registry: None,
+            skill_catalog: None,
+            scheduler: None,
+            chat_rate_limiter: RateLimiter::new(30, 60),
+            registry_entries: vec![],
+            cost_guard: None,
+            routine_engine: Arc::new(tokio::sync::RwLock::new(None)),
+            startup_time: std::time::Instant::now(),
+            webhook_proxy_addr: None, // Not configured
+        });
+
+        let app = Router::new()
+            .route("/webhook/{*path}", post(webhook_proxy_handler))
+            .with_state(state);
+
+        let req = axum::http::Request::builder()
+            .method("POST")
+            .uri("/webhook/slack")
+            .body(Body::empty())
+            .expect("request");
+
+        let resp = ServiceExt::<axum::http::Request<Body>>::oneshot(app, req)
+            .await
+            .expect("response");
+
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[tokio::test]
+    async fn test_webhook_proxy_forwards_to_different_paths() {
+        use axum::body::Body;
+        use tower::ServiceExt;
+
+        let (webhook_addr, _handle) = start_mock_webhook_server().await;
+
+        let state = Arc::new(GatewayState {
+            msg_tx: tokio::sync::RwLock::new(None),
+            sse: SseManager::new(),
+            workspace: None,
+            session_manager: None,
+            log_broadcaster: None,
+            log_level_handle: None,
+            extension_manager: None,
+            tool_registry: None,
+            store: None,
+            job_manager: None,
+            prompt_queue: None,
+            user_id: "test".to_string(),
+            shutdown_tx: tokio::sync::RwLock::new(None),
+            ws_tracker: None,
+            llm_provider: None,
+            skill_registry: None,
+            skill_catalog: None,
+            scheduler: None,
+            chat_rate_limiter: RateLimiter::new(30, 60),
+            registry_entries: vec![],
+            cost_guard: None,
+            routine_engine: Arc::new(tokio::sync::RwLock::new(None)),
+            startup_time: std::time::Instant::now(),
+            webhook_proxy_addr: Some(webhook_addr),
+        });
+
+        let app = Router::new()
+            .route("/webhook/{*path}", post(webhook_proxy_handler))
+            .with_state(state);
+
+        // Test /webhook/slack path
+        let req = axum::http::Request::builder()
+            .method("POST")
+            .uri("/webhook/slack")
+            .body(Body::empty())
+            .expect("request");
+
+        let resp = ServiceExt::<axum::http::Request<Body>>::oneshot(app, req)
+            .await
+            .expect("response");
+
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let body = axum::body::to_bytes(resp.into_body(), 1024)
+            .await
+            .expect("body");
+        assert_eq!(&body[..], b"slack-webhook-received");
     }
 }

@@ -421,7 +421,9 @@ async fn async_main() -> anyhow::Result<()> {
     }
 
     // Start the unified webhook server if any routes were registered.
-    let mut webhook_server = if !webhook_routes.is_empty() {
+    // Save the address for the gateway's webhook proxy (tunnel → gateway → webhook server).
+    let mut webhook_server: Option<WebhookServer> = None;
+    let webhook_server_final_addr: Option<std::net::SocketAddr> = if !webhook_routes.is_empty() {
         let addr =
             webhook_server_addr.unwrap_or_else(|| std::net::SocketAddr::from(([0, 0, 0, 0], 8080)));
         if addr.ip().is_unspecified() {
@@ -436,7 +438,8 @@ async fn async_main() -> anyhow::Result<()> {
             server.add_routes(routes);
         }
         server.start().await?;
-        Some(server)
+        webhook_server = Some(server);
+        Some(addr)
     } else {
         None
     };
@@ -526,6 +529,10 @@ async fn async_main() -> anyhow::Result<()> {
             gw = gw.with_skill_catalog(Arc::clone(sc));
         }
         gw = gw.with_cost_guard(Arc::clone(&components.cost_guard));
+        // Configure webhook proxy so tunnel can reach webhook server
+        if let Some(wh_addr) = webhook_server_final_addr {
+            gw = gw.with_webhook_proxy(wh_addr);
+        }
         if config.sandbox.enabled {
             gw = gw.with_prompt_queue(Arc::clone(&prompt_queue));
 
