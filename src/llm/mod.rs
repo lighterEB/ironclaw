@@ -6,12 +6,18 @@
 //! - **Anthropic**: Direct API access with your own key
 //! - **Ollama**: Local model inference
 //! - **OpenAI-compatible**: Any endpoint that speaks the OpenAI API
+//! - **AWS Bedrock**: Native Converse API via aws-sdk-bedrockruntime
 
 mod anthropic_oauth;
+#[cfg(feature = "bedrock")]
+mod bedrock;
 pub mod circuit_breaker;
+pub mod config;
 pub mod costs;
+pub mod error;
 pub mod failover;
 mod nearai_chat;
+pub mod oauth_helpers;
 mod provider;
 mod reasoning;
 pub mod recording;
@@ -22,7 +28,15 @@ mod rig_adapter;
 pub mod session;
 pub mod smart_routing;
 
+pub mod image_models;
+pub mod vision_models;
+
 pub use circuit_breaker::{CircuitBreakerConfig, CircuitBreakerProvider};
+pub use config::{
+    BedrockConfig, CacheRetention, LlmConfig, NearAiConfig, OAUTH_PLACEHOLDER,
+    RegistryProviderConfig,
+};
+pub use error::LlmError;
 pub use failover::{CooldownConfig, FailoverProvider};
 pub use nearai_chat::{ModelInfo, NearAiChatProvider};
 pub use provider::{
@@ -47,14 +61,14 @@ use std::sync::Arc;
 use rig::client::CompletionClient;
 use secrecy::ExposeSecret;
 
-use crate::config::{LlmConfig, NearAiConfig, RegistryProviderConfig};
-use crate::error::LlmError;
+// LlmConfig, NearAiConfig, RegistryProviderConfig, and LlmError are
+// re-exported via `pub use` above from config and error submodules.
 
 /// Create an LLM provider based on configuration.
 ///
 /// - NearAI backend: Uses session manager for authentication
 /// - Registry providers: Looked up by protocol and constructed generically
-pub fn create_llm_provider(
+pub async fn create_llm_provider(
     config: &LlmConfig,
     session: Arc<SessionManager>,
 ) -> Result<Arc<dyn LlmProvider>, LlmError> {
@@ -62,6 +76,21 @@ pub fn create_llm_provider(
 
     if config.backend == "nearai" || config.backend == "near_ai" || config.backend == "near" {
         return create_llm_provider_with_config(&config.nearai, session, timeout);
+    }
+
+    // Bedrock uses a native AWS SDK, not the rig-core registry
+    if config.backend == "bedrock" {
+        #[cfg(feature = "bedrock")]
+        {
+            return create_bedrock_provider(config).await;
+        }
+        #[cfg(not(feature = "bedrock"))]
+        {
+            return Err(LlmError::RequestFailed {
+                provider: "bedrock".to_string(),
+                reason: "Bedrock support not compiled. Rebuild with --features bedrock".to_string(),
+            });
+        }
     }
 
     let reg_config = config
@@ -115,6 +144,24 @@ fn create_registry_provider(
         ProviderProtocol::Anthropic => create_anthropic_from_registry(config),
         ProviderProtocol::Ollama => create_ollama_from_registry(config),
     }
+}
+
+#[cfg(feature = "bedrock")]
+async fn create_bedrock_provider(config: &LlmConfig) -> Result<Arc<dyn LlmProvider>, LlmError> {
+    let br = config
+        .bedrock
+        .as_ref()
+        .ok_or_else(|| LlmError::AuthFailed {
+            provider: "bedrock".to_string(),
+        })?;
+
+    let provider = bedrock::BedrockProvider::new(br).await?;
+    tracing::info!(
+        "Using AWS Bedrock (Converse API, region: {}, model: {})",
+        br.region,
+        provider.active_model_name(),
+    );
+    Ok(Arc::new(provider))
 }
 
 fn create_openai_compat_from_registry(
@@ -193,7 +240,7 @@ fn create_anthropic_from_registry(
     let api_key_is_placeholder = config
         .api_key
         .as_ref()
-        .is_some_and(|k| k.expose_secret() == crate::config::llm::OAUTH_PLACEHOLDER);
+        .is_some_and(|k| k.expose_secret() == crate::llm::config::OAUTH_PLACEHOLDER);
     if config.oauth_token.is_some() && (config.api_key.is_none() || api_key_is_placeholder) {
         tracing::info!(
             provider = %config.provider_id,
@@ -205,8 +252,7 @@ fn create_anthropic_from_registry(
         return Ok(Arc::new(provider));
     }
 
-    use crate::config::CacheRetention;
-    use crate::config::helpers::optional_env;
+    use crate::llm::config::CacheRetention;
     use rig::providers::anthropic;
 
     let api_key = config
@@ -230,21 +276,7 @@ fn create_anthropic_from_registry(
         reason: format!("Failed to create Anthropic client: {e}"),
     })?;
 
-    // Resolve prompt cache retention from env (default: Short).
-    // Injects top-level cache_control via additional_params for Anthropic
-    // automatic caching (the API auto-places the breakpoint at the last
-    // cacheable block).
-    let cache_retention: CacheRetention = optional_env("ANTHROPIC_CACHE_RETENTION")
-        .ok()
-        .flatten()
-        .and_then(|val| match val.parse::<CacheRetention>() {
-            Ok(r) => Some(r),
-            Err(e) => {
-                tracing::warn!("Invalid ANTHROPIC_CACHE_RETENTION: {e}; defaulting to short");
-                None
-            }
-        })
-        .unwrap_or_default();
+    let cache_retention = config.cache_retention;
 
     let model = client.completion_model(&config.model);
 
@@ -341,7 +373,7 @@ pub fn create_cheap_llm_provider(
 /// This is the single source of truth for provider chain construction,
 /// called by both `main.rs` and `app.rs`.
 #[allow(clippy::type_complexity)]
-pub fn build_provider_chain(
+pub async fn build_provider_chain(
     config: &LlmConfig,
     session: Arc<SessionManager>,
 ) -> Result<
@@ -352,7 +384,7 @@ pub fn build_provider_chain(
     ),
     LlmError,
 > {
-    let llm = create_llm_provider(config, session.clone())?;
+    let llm = create_llm_provider(config, session.clone()).await?;
     tracing::info!("LLM provider initialized: {}", llm.model_name());
 
     // 1. Retry
@@ -492,7 +524,7 @@ pub fn build_provider_chain(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::NearAiConfig;
+    use crate::llm::config::NearAiConfig;
 
     fn test_nearai_config() -> NearAiConfig {
         NearAiConfig {
@@ -519,6 +551,7 @@ mod tests {
             session: SessionConfig::default(),
             nearai: test_nearai_config(),
             provider: None,
+            bedrock: None,
             request_timeout_secs: 120,
         }
     }
